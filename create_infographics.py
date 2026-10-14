@@ -248,88 +248,200 @@ def make_site():
 # ============================================================
 # 4) ADRESSE / HERO — recouvre l'ancien texte avec une plaque solide
 # ============================================================
+def patch_region_wall(img, x0, x1, y0, y1, feather_v=36, feather_h=30, band=26):
+    """Efface un texte incrusté sur un mur uniforme : chaque colonne de la zone
+    est reconstruite par interpolation verticale entre la bande de pixels juste
+    au-dessus et celle juste en dessous (le mur est régulier verticalement, donc
+    le résultat est indissociable du fond)."""
+    import numpy as np
+    a = np.array(img).astype(np.float32)
+    H_img, W_img, _ = a.shape
+    x0, x1 = max(0, x0), min(W_img, x1)
+    y0, y1 = max(band * 3, y0), min(H_img - band * 3, y1)
+    top = a[y0 - 2 * band:y0 - band, x0:x1].mean(axis=0)      # (W, 3)
+    bot = a[y1 + band:y1 + 2 * band, x0:x1].mean(axis=0)      # (W, 3)
+    H, W = y1 - y0, x1 - x0
+    t = np.linspace(0.0, 1.0, H)[:, None, None]
+    fill = top[None, :, :] * (1 - t) + bot[None, :, :] * t
+    patch = Image.fromarray(fill.astype(np.uint8), "RGB").convert("RGBA")
+    # Masque : 1 au centre, fondu sur les bords (le fondu reste hors du texte)
+    g = np.ones((H, W), np.float32)
+    for i in range(feather_v):
+        f = i / feather_v
+        g[i, :] *= f
+        g[H - 1 - i, :] *= f
+    for j in range(feather_h):
+        f = j / feather_h
+        g[:, j] *= f
+        g[:, W - 1 - j] *= f
+    patch.putalpha(Image.fromarray((g * 255).astype(np.uint8), "L"))
+    base = img.convert("RGBA")
+    base.alpha_composite(patch, (x0, y0))
+    return base.convert("RGB")
+
+
+def fit_font(text, target_w, font_path=FONT_BOLD):
+    """Renvoie une police réglée pour que le texte occupe ~target_w de large."""
+    probe = ImageFont.truetype(font_path, 100)
+    bb = probe.getbbox(text)
+    w100 = max(1, bb[2] - bb[0])
+    return ImageFont.truetype(font_path, max(12, int(100 * target_w / w100)))
+
+
+def text_soft_shadow(base, xy, text, font, fill=WHITE,
+                     shadow=(5, 28, 75, 215), offset=None, blur=None, stroke=None):
+    """Texte net + ombre diffuse (lisibilité sur fond clair)."""
+    x, y = xy
+    offset = offset or max(2, int(font.size * 0.022))
+    blur = blur or max(6, int(font.size * 0.085))
+    stroke = stroke if stroke is not None else max(1, int(font.size * 0.014))
+    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text((x + offset, y + offset), text, font=font,
+                               fill=shadow, stroke_width=stroke, stroke_fill=shadow)
+    layer = layer.filter(ImageFilter.GaussianBlur(blur))
+    base.alpha_composite(layer)
+    ImageDraw.Draw(base).text((x, y), text, font=font, fill=fill)
+    return base
+
+
+def text_halo(base, xy, text, font, fill, halo=(255, 255, 255, 170), r=3):
+    """Texte avec halo clair (petits textes sur fond moyen)."""
+    x, y = xy
+    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for dx in range(-r, r + 1, 2):
+        for dy in range(-r, r + 1, 2):
+            if dx or dy:
+                d.text((x + dx, y + dy), text, font=font, fill=halo)
+    layer = layer.filter(ImageFilter.GaussianBlur(max(1, r // 2)))
+    base.alpha_composite(layer)
+    ImageDraw.Draw(base).text((x, y), text, font=font, fill=fill)
+    return base
+
+
+def paste_logo_shadowed(base, logo, xy, logo_w, shadow_alpha=150):
+    """Colle le logo avec une ombre portée douce et proportionnée."""
+    lw = logo_w
+    lh = int(logo_w * logo.size[1] / logo.size[0])
+    logo_r = logo.resize((lw, lh), Image.LANCZOS)
+    blur = max(8, int(lw * 0.055))
+    off = max(3, int(lw * 0.020))
+    pad = blur * 2
+    alpha = logo_r.getchannel("A")
+    sh = Image.new("RGBA", (lw + 2 * pad, lh + 2 * pad), (0, 0, 0, 0))
+    sh.paste(Image.new("RGBA", (lw, lh), (2, 22, 60, 255)), (pad, pad), alpha)
+    sh = sh.filter(ImageFilter.GaussianBlur(blur))
+    sh.putalpha(sh.getchannel("A").point(lambda p: int(p * shadow_alpha / 255)))
+    x, y = xy
+    lay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    lay.alpha_composite(sh, (max(0, x - pad + off), max(0, y - pad + off)))
+    base = Image.alpha_composite(base, lay)
+    lay2 = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    lay2.paste(logo_r, (x, y), logo_r)
+    return Image.alpha_composite(base, lay2)
+
+
+# ============================================================
+# 4) IMAGE ADRESSE / HERO
+# ============================================================
 def make_adresse():
     print("→ 04 Image Adresse / Hero")
     img = Image.open("Adresse.jpg.jpeg").convert("RGB")
     img = enhance_image(img)
     w, h = img.size
-    # Ratio 4:5
-    target_h = int(w * 5 / 4)
-    if target_h < h:
-        top = (h - target_h) // 2
-        img = img.crop((0, top, w, top + target_h))
-        h = target_h
 
-    # Dégradé bleu fort à gauche (couvre totalement l'ancien texte)
-    # On utilise un dégradé exponentiel plus doux vers la droite pour un effet "plaque" naturel
-    img = add_gradient_left(img, width_ratio=0.68, color=GELPAZ_BLUE, max_alpha=252, exp=0.75)
-    # Plaque rectangulaire plus basse pour effacer tout reste de l'ancien titre, avec bord droit dégradé
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(overlay)
-    plaque_w = int(w * 0.58)
-    plaque_top = int(h * 0.28)
-    plaque_bot = int(h * 0.72)
-    d.rectangle([0, plaque_top, plaque_w - 120, plaque_bot], fill=(*GELPAZ_BLUE, 255))
-    # Bord droit de la plaque en dégradé pour transition douce
-    for x in range(120):
-        alpha = int(255 * (1 - x / 120) ** 0.7)
-        d.line([(plaque_w - 120 + x, plaque_top),
-                (plaque_w - 120 + x, plaque_bot)],
-               fill=(*GELPAZ_BLUE, alpha))
-    img = Image.alpha_composite(img.convert("RGBA"), overlay)
-    # Léger re-dégradé pour homogénéiser
-    img = add_gradient_left(img, width_ratio=0.70, color=GELPAZ_BLUE, max_alpha=120, exp=1.2)
-    # Dégradé bas pour l'info contact
-    grad = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    dg = ImageDraw.Draw(grad)
-    gh = int(h * 0.18)
-    for y in range(gh):
-        t = y / gh
-        alpha = int(230 * t ** 1.2)
-        dg.line([(0, h - gh + y), (w, h - gh + y)], fill=(*GELPAZ_DARK, alpha))
-    img = Image.alpha_composite(img.convert("RGBA"), grad)
-    # Barres
-    add_horizontal_bars(img, GELPAZ_BLUE, GELPAZ_DARK, 16, 18)
-    # Logo haut gauche — en BLANC (inversé) sur fond bleu, technique infographique standard
-    img = add_logo(img, load_logo(invert_white=True), "top-left", 0.15, 55, shadow=True)
-    # Badge haut droite
-    img = add_badge(img, "L'ADRESSE DE VOS PROJETS", GOLD, "top-right", 70, font_ratio=0.011)
-    # Bloc texte
-    draw = ImageDraw.Draw(img)
-    margin = 70
-    text_x = margin
-    text_y = int(h * 0.38)
-    tag_font = ImageFont.truetype(FONT_BOLD, int(w * 0.014))
-    title_font = ImageFont.truetype(FONT_BOLD, int(w * 0.062))
-    sub_font = ImageFont.truetype(FONT_BOLD, int(w * 0.037))
-    info_font = ImageFont.truetype(FONT_BOLD, int(w * 0.020))
-    # Tag
-    tag = "✦  IMMOBILIER · CONSTRUCTION · ACCOMPAGNEMENT"
-    draw.text((text_x, text_y - int(w * 0.04)), tag, font=tag_font, fill=GELPAZ_LIGHT)
-    # Titre
-    draw.text((text_x + 3, text_y + 3), "GELPAZ IMMO SA,", font=title_font, fill=(0, 20, 60, 200))
-    draw.text((text_x, text_y), "GELPAZ IMMO SA,", font=title_font, fill=WHITE)
-    # Sous-titre
-    sy = text_y + int(w * 0.072)
-    draw.text((text_x + 3, sy + 3), "L'adresse pour votre projet de vie.", font=sub_font, fill=(0, 20, 60, 200))
-    draw.text((text_x, sy), "L'adresse pour votre projet de vie.", font=sub_font, fill=WHITE)
-    # Séparateur doré
-    sep_y = sy + int(w * 0.048)
-    draw.rectangle([text_x, sep_y, text_x + int(w * 0.09), sep_y + 8], fill=GOLD)
-    draw.rectangle([text_x + int(w * 0.09), sep_y + 2, text_x + int(w * 0.18), sep_y + 6], fill=GELPAZ_LIGHT)
-    # Contact en bas à gauche
-    info_y = h - int(w * 0.055)
-    draw.text((text_x + 2, info_y + 2),
-              "📞  +225 00 00 00 00 00    ·    ✉  contact@gelpazimmo.ci",
-              font=info_font, fill=(0, 0, 0, 150))
-    draw.text((text_x, info_y),
-              "📞  +225 00 00 00 00 00    ·    ✉  contact@gelpazimmo.ci",
-              font=info_font, fill=WHITE)
+    # 1) Effacer le texte incrusté d'origine (posé sur le mur bleu clair uni)
+    img = patch_region_wall(img, int(0.044 * w), int(0.544 * w), int(0.371 * h), int(0.481 * h))
+    base = img.convert("RGBA")
+
+    # 2) Barres d'identité GELPAZ (fines, en haut et en bas)
+    add_horizontal_bars(base, GELPAZ_BLUE, GELPAZ_DARK,
+                        max(8, int(w * 0.0035)), max(10, int(w * 0.0040)))
+
+    # 3) Logo blanc (inversé) ombré en haut à gauche + badge doré en haut à droite
+    base = paste_logo_shadowed(base, load_logo(invert_white=True),
+                               (int(w * 0.014), int(w * 0.014)), int(w * 0.145))
+    base = add_badge(base, "L'ADRESSE DE VOS PROJETS", GOLD, "top-right",
+                     int(w * 0.016), font_ratio=0.011)
+
+    # 4) Bloc texte — à l'emplacement naturel du texte d'origine (zone nettoyée)
+    x_txt = int(w * 0.055)
+    f_tag = ImageFont.truetype(FONT_BOLD, int(w * 0.0132))
+    f_title = fit_font("GELPAZ IMMO SA,", int(w * 0.470))
+    f_sub = fit_font("L'adresse pour votre projet de vie.", int(w * 0.455))
+    tag = "IMMOBILIER   ·   CONSTRUCTION   ·   ACCOMPAGNEMENT"
+    tag_y = int(h * 0.349)
+    title = "GELPAZ IMMO SA,"
+    t_y = int(h * 0.380)
+    sub = "L'adresse pour votre projet de vie."
+    s_y = t_y + int(w * 0.0625)
+
+    text_halo(base, (x_txt, tag_y), tag, f_tag, GELPAZ_DARK, r=4)
+    text_soft_shadow(base, (x_txt, t_y), title, f_title)
+    text_soft_shadow(base, (x_txt, s_y), sub, f_sub)
+
+    # Barre d'accent dorée + bleue sous le slogan
+    d = ImageDraw.Draw(base)
+    bar_y = s_y + int(w * 0.0465)
+    h_bar = max(6, int(w * 0.0022))
+    d.rectangle([x_txt, bar_y, x_txt + int(w * 0.065), bar_y + h_bar - 2], fill=GOLD)
+    d.rectangle([x_txt + int(w * 0.065), bar_y, x_txt + int(w * 0.130), bar_y + h_bar - 4],
+                fill=GELPAZ_LIGHT)
+
+    # 5) Carte contact (bas gauche) — vraies coordonnées
+    contacts = [("Tél.", "+226 25 37 10 55"),
+                ("WhatsApp", "+226 67 30 81 85"),
+                ("Email", "infos@gelpaz.com")]
+    f_lab = ImageFont.truetype(FONT_BOLD, int(w * 0.0165))
+    f_val = ImageFont.truetype(FONT_BOLD, int(w * 0.0195))
+    meas = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+    lab_w = max(meas.textbbox((0, 0), l, font=f_lab)[2] for l, _ in contacts)
+    val_w = max(meas.textbbox((0, 0), v, font=f_val)[2] for _, v in contacts)
+    bullet_w = max(6, int(w * 0.0038))
+    gap = int(w * 0.0075)
+    inner = int(w * 0.018)
+    line_h = int(w * 0.033)
+    card_w = inner * 2 + bullet_w + gap + lab_w + gap + val_w
+    card_h = inner * 2 + line_h * len(contacts)
+    card_x = int(w * 0.014)
+    card_y = h - card_h - int(w * 0.014) - int(w * 0.0040)
+
+    # Ombre douce de la carte
+    sh = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    o = max(6, int(w * 0.004))
+    ImageDraw.Draw(sh).rounded_rectangle(
+        [card_x + o, card_y + o * 2, card_x + card_w + o, card_y + card_h + o * 2],
+        radius=int(w * 0.009), fill=(0, 15, 45, 140))
+    sh = sh.filter(ImageFilter.GaussianBlur(max(8, int(w * 0.005))))
+    base.alpha_composite(sh)
+
+    card = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    dc = ImageDraw.Draw(card)
+    dc.rounded_rectangle([card_x, card_y, card_x + card_w, card_y + card_h],
+                         radius=int(w * 0.009), fill=(*GELPAZ_DARK, 210),
+                         outline=(255, 255, 255, 80), width=max(2, int(w * 0.0006)))
+    base = Image.alpha_composite(base, card)
+
+    d = ImageDraw.Draw(base)
+    for i, (lab, val) in enumerate(contacts):
+        cy = card_y + inner + line_h * i + line_h // 2
+        bx = card_x + inner
+        d.rectangle([bx, cy - int(line_h * 0.28), bx + bullet_w, cy + int(line_h * 0.28)],
+                    fill=GOLD)
+        tx = bx + bullet_w + gap
+        d.text((tx, cy), lab, font=f_lab, fill=GELPAZ_LIGHT, anchor="lm")
+        d.text((tx + lab_w + gap, cy), val, font=f_val, fill=WHITE, anchor="lm")
+
+    # 6) Fond opaque + enregistrement
+    out_img = Image.alpha_composite(Image.new("RGBA", base.size, (255, 255, 255, 255)), base)
     out = os.path.join(OUT_DIR, "04_Adresse_Hero_Gelpaz.jpg")
-    img.convert("RGB").save(out, "JPEG", quality=93, optimize=True)
+    out_img.convert("RGB").save(out, "JPEG", quality=93, optimize=True)
     print(f"  ✓ {out}")
 
 
+# ============================================================
+# 5) SUITE
+# ============================================================
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
     make_reception()
